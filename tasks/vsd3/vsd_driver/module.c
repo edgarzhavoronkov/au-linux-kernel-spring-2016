@@ -18,6 +18,7 @@
 #include "vsd_ioctl.h"
 
 #define LOG_TAG "[VSD_CHAR_DEVICE] "
+#define MAX_MEM PAGE_SIZE * 2
 
 typedef struct vsd_dev {
     struct miscdevice mdev;
@@ -28,7 +29,7 @@ typedef struct vsd_dev {
 } vsd_dev_t;
 static vsd_dev_t *vsd_dev;
 
-#define LOCAL_DEBUG 0
+#define LOCAL_DEBUG 1
 static void print_vsd_dev_hw_regs(vsd_dev_t *vsd_dev)
 {
     if (!LOCAL_DEBUG)
@@ -66,8 +67,7 @@ static int vsd_dev_release(struct inode *inode, struct file *filp)
 
 static void vsd_dev_dma_op_complete_tsk_func(unsigned long unused)
 {
-    (void)unused;
-    // TODO wakeup task waiting for completion of VSD cmd
+    wake_up(&vsd_dev->dma_op_compete_wq);
 }
 
 static ssize_t vsd_dev_read(struct file *filp,
@@ -76,6 +76,8 @@ static ssize_t vsd_dev_read(struct file *filp,
     ssize_t ret = 0;
     void *kdma_buf = NULL;
 
+    mutex_lock(&vsd_dev->dev_ops_serialization_mutex);
+
     print_vsd_dev_hw_regs(vsd_dev);
 
     if (vsd_dev->hwregs->cmd != VSD_CMD_NONE) {
@@ -83,7 +85,11 @@ static ssize_t vsd_dev_read(struct file *filp,
         goto exit;
     }
 
-    // TODO check not to alloc too much DMA memory (easy DDOS)
+    if (read_size > MAX_MEM) {
+        ret = -EINVAL;
+        goto exit;
+    }
+
     kdma_buf = kzalloc(read_size, GFP_KERNEL);
     if (!kdma_buf) {
         ret = -ENOMEM;
@@ -99,15 +105,17 @@ static ssize_t vsd_dev_read(struct file *filp,
     wmb();
     vsd_dev->hwregs->cmd = VSD_CMD_READ;
 
-    /* 
+    /*
      * Suppose we've changed
      * wait_event call to wait_event_interruptible call.
      * Describe sequence of events (step by step) that lead to
      * write to freed kernel buffer in vsd_* kernel code.
-     * 1. TODO
-     * 2. TODO
-     * 3. TODO
-     * ...
+     * 1. Driver calls vsd_dev_read
+     * 2. While waiting for event, signal comes and we are interrupted
+     * 3. Scheduler reschedules us for another task
+     * 4. Someone frees kernel buffer
+     * 5. Scheduler reschedules us back here
+     * 6. We are writing to freed buffer
      */
     wait_event(vsd_dev->dma_op_compete_wq,
             vsd_dev->hwregs->cmd == VSD_CMD_NONE);
@@ -128,6 +136,7 @@ exit_free_dma:
     kfree(kdma_buf);
 exit:
     print_vsd_dev_hw_regs(vsd_dev);
+    mutex_unlock(&vsd_dev->dev_ops_serialization_mutex);
 
     return ret;
 }
@@ -138,13 +147,19 @@ static ssize_t vsd_dev_write(struct file *filp,
     ssize_t ret = 0;
     void *kdma_buf = NULL;
 
+    mutex_lock(&vsd_dev->dev_ops_serialization_mutex);
+
     print_vsd_dev_hw_regs(vsd_dev);
     if (vsd_dev->hwregs->cmd != VSD_CMD_NONE) {
         ret = -EBUSY;
         goto exit;
     }
 
-    // TODO check not to alloc too much DMA memory (easy DDOS)
+    if (write_size > MAX_MEM) {
+        ret = -EINVAL;
+        goto exit;
+    }
+
     kdma_buf = kzalloc(write_size, GFP_KERNEL);
     if (!kdma_buf) {
         ret = -ENOMEM;
@@ -179,6 +194,7 @@ exit_free_dma:
     kfree(kdma_buf);
 exit:
     print_vsd_dev_hw_regs(vsd_dev);
+    mutex_unlock(&vsd_dev->dev_ops_serialization_mutex);
 
     return ret;
 }
@@ -223,8 +239,26 @@ static long vsd_ioctl_get_size(vsd_ioctl_get_size_arg_t __user *uarg)
 
 static long vsd_ioctl_set_size(vsd_ioctl_set_size_arg_t __user *uarg)
 {
-    // TODO implement
-    return 0;
+    long ret = 0;
+    vsd_ioctl_set_size_arg_t arg;
+    if (copy_from_user(&arg, uarg, sizeof(arg))) {
+        return -EFAULT;
+    }
+
+    mutex_lock(&vsd_dev->dev_ops_serialization_mutex);
+
+    vsd_dev->hwregs->result = 0;
+    vsd_dev->hwregs->tasklet_vaddr = (uint64_t)&vsd_dev->dma_op_complete_tsk;
+    vsd_dev->hwregs->dev_offset = arg.size;
+    wmb();
+    vsd_dev->hwregs->cmd = VSD_CMD_SET_SIZE;
+
+    wait_event(vsd_dev->dma_op_compete_wq, vsd_dev->hwregs->cmd == VSD_CMD_NONE);
+
+    ret = vsd_dev->hwregs->result;
+
+    mutex_unlock(&vsd_dev->dev_ops_serialization_mutex);
+    return ret;
 }
 
 static long vsd_dev_ioctl(struct file *filp, unsigned int cmd,
@@ -268,10 +302,7 @@ static int vsd_driver_probe(struct platform_device *pdev)
         pr_warn(LOG_TAG "Can't allocate memory\n");
         goto error_alloc;
     }
-    // TODO use this mutex to make queue of tasks
-    // that wait to run their VSD cmds.
-    // Only one task should be able execute VSD cmd
-    // simultaneously.
+
     mutex_init(&vsd_dev->dev_ops_serialization_mutex);
     tasklet_init(&vsd_dev->dma_op_complete_tsk,
             vsd_dev_dma_op_complete_tsk_func, 0);
