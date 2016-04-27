@@ -1,0 +1,1 @@
+cmd_/home/edgar/University/AU/V_Course/II_Semester/LinuxKernel/au-linux-kernel-spring-2016/tasks/linked_lists/built-in.o :=  rm -f /home/edgar/University/AU/V_Course/II_Semester/LinuxKernel/au-linux-kernel-spring-2016/tasks/linked_lists/built-in.o; ar rcsD /home/edgar/University/AU/V_Course/II_Semester/LinuxKernel/au-linux-kernel-spring-2016/tasks/linked_lists/built-in.o
